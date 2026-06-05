@@ -8,45 +8,39 @@ namespace DiscordDmBot.Discord.Modules
 {
     public class CampaignModule : InteractionModuleBase<SocketInteractionContext>
     {
-        private readonly CampaignManager _campaignManager;
-        private readonly System.IServiceProvider _serviceProvider;
-
-        public CampaignModule(CampaignManager campaignManager, System.IServiceProvider serviceProvider)
-        {
-            _campaignManager = campaignManager;
-            _serviceProvider = serviceProvider;
-        }
+        public CampaignManager CampaignManager { get; set; }
+        public System.IServiceProvider ServiceProvider { get; set; }
 
         [SlashCommand("start_campaign", "Startet eine neue Kampagne in diesem Kanal.")]
         public async Task StartCampaignAsync([Summary("intro", "Kurzer Kontext oder Vorgeschichte")] string intro = "")
         {
-            if (_campaignManager.IsCampaignActive(Context.Channel.Id))
+            if (CampaignManager.IsCampaignActive(Context.Channel.Id))
             {
                 await RespondAsync("Es läuft bereits eine Kampagne in diesem Kanal.");
                 return;
             }
 
-            _campaignManager.StartCampaign(Context.Channel.Id, intro);
+            CampaignManager.StartCampaign(Context.Channel.Id, intro);
             await RespondAsync($"Kampagne gestartet! {(!string.IsNullOrWhiteSpace(intro) ? $"Kontext: {intro}" : "")}");
         }
 
         [SlashCommand("stop_campaign", "Beendet die aktive Kampagne in diesem Kanal.")]
         public async Task StopCampaignAsync()
         {
-            if (!_campaignManager.IsCampaignActive(Context.Channel.Id))
+            if (!CampaignManager.IsCampaignActive(Context.Channel.Id))
             {
                 await RespondAsync("Hier läuft aktuell keine Kampagne.");
                 return;
             }
 
-            _campaignManager.StopCampaign(Context.Channel.Id);
+            CampaignManager.StopCampaign(Context.Channel.Id);
             await RespondAsync("Kampagne beendet. Das Langzeitgedächtnis bleibt gespeichert.");
         }
 
         [SlashCommand("summarize", "Erzwingt eine sofortige Zusammenfassung der aktuellen Ereignisse.")]
         public async Task SummarizeAsync()
         {
-            if (!_campaignManager.IsCampaignActive(Context.Channel.Id))
+            if (!CampaignManager.IsCampaignActive(Context.Channel.Id))
             {
                 await RespondAsync("Hier läuft aktuell keine Kampagne.");
                 return;
@@ -54,10 +48,10 @@ namespace DiscordDmBot.Discord.Modules
 
             await DeferAsync();
 
-            using var scope = _serviceProvider.CreateScope();
+            using var scope = ServiceProvider.CreateScope();
             var ollamaService = scope.ServiceProvider.GetRequiredService<OllamaService>();
             
-            var state = _campaignManager.GetCampaignState(Context.Channel.Id);
+            var state = CampaignManager.GetCampaignState(Context.Channel.Id);
             if (state == null)
             {
                 await FollowupAsync("Fehler beim Laden der Kampagne.");
@@ -74,7 +68,7 @@ namespace DiscordDmBot.Discord.Modules
                 }
 
                 await ollamaService.SummarizeChatAsync(Context.Channel.Id, messagesToSummarize);
-                _campaignManager.ClearOldMessages(Context.Channel.Id, 0);
+                CampaignManager.ClearOldMessages(Context.Channel.Id, 0);
                 
                 await FollowupAsync("Die Ereignisse wurden erfolgreich zusammengefasst und im Langzeitgedächtnis gespeichert.");
             }
