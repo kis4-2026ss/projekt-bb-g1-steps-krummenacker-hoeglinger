@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Discord;
@@ -46,6 +47,7 @@ namespace DiscordDmBot.Discord
             _client.Ready += ReadyAsync;
             _client.MessageReceived += MessageReceivedAsync;
             _client.InteractionCreated += InteractionCreatedAsync;
+            _interactionService.SlashCommandExecuted += SlashCommandExecutedAsync;
 
             var token = _configuration["DiscordToken"];
             if (string.IsNullOrWhiteSpace(token) || token == "YOUR_DISCORD_BOT_TOKEN_HERE")
@@ -62,6 +64,31 @@ namespace DiscordDmBot.Discord
             await Task.Delay(-1, stoppingToken);
         }
 
+        private async Task SlashCommandExecutedAsync(SlashCommandInfo command, IInteractionContext context, IResult result)
+        {
+            if (!result.IsSuccess)
+            {
+                _logger.LogError($"Slash command failed: {result.ErrorReason}");
+                try
+                {
+                    // Try to send the error to the channel
+                    var errorMsg = $"❌ **Command Error:** `{result.ErrorReason}`";
+                    if (context.Interaction.HasResponded)
+                    {
+                        await context.Interaction.FollowupAsync(errorMsg, ephemeral: true);
+                    }
+                    else
+                    {
+                        await context.Interaction.RespondAsync(errorMsg, ephemeral: true);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Failed to send error message to Discord.");
+                }
+            }
+        }
+
         private async Task InteractionCreatedAsync(SocketInteraction interaction)
         {
             try
@@ -69,12 +96,21 @@ namespace DiscordDmBot.Discord
                 var context = new SocketInteractionContext(_client, interaction);
                 await _interactionService.ExecuteCommandAsync(context, _serviceProvider);
             }
-            catch
+            catch (Exception ex)
             {
-                if (interaction.Type == InteractionType.ApplicationCommand)
+                _logger.LogError(ex, "Exception occurred while executing interaction.");
+                try
                 {
-                    await interaction.GetOriginalResponseAsync().ContinueWith(async (msg) => await msg.Result.DeleteAsync());
+                    if (!interaction.HasResponded)
+                    {
+                        await interaction.RespondAsync($"❌ **Critical Error:** `{ex.Message}`", ephemeral: true);
+                    }
+                    else
+                    {
+                        await interaction.FollowupAsync($"❌ **Critical Error:** `{ex.Message}`", ephemeral: true);
+                    }
                 }
+                catch { /* Ignore if we can't respond */ }
             }
         }
 
@@ -86,84 +122,18 @@ namespace DiscordDmBot.Discord
 
         private async Task MessageReceivedAsync(SocketMessage message)
         {
-            if (message.Author.IsBot || message.Channel is not SocketTextChannel)
+            if (message.Author.IsBot)
                 return;
 
-            var channelId = message.Channel.Id;
-
-            if (!_campaignManager.IsCampaignActive(channelId))
-                return;
-
-            _campaignManager.AddMessage(channelId, "user", $"{message.Author.Username}: {message.Content}");
-
-            using var scope = _serviceProvider.CreateScope();
-            var ollamaService = scope.ServiceProvider.GetRequiredService<OllamaService>();
-            
-            var state = _campaignManager.GetCampaignState(channelId);
-            if (state == null) return;
-
-            using (message.Channel.EnterTypingState())
-            {
-                try
-                {
-                    var response = await ollamaService.GenerateResponseAsync(channelId, state.Context, state.ShortTermMemory);
-                    
-                    if (!string.IsNullOrWhiteSpace(response))
-                    {
-                        await SendMessageInChunksAsync(message.Channel, response);
-                        _campaignManager.AddMessage(channelId, "assistant", response);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Error generating response from Ollama");
-                    await message.Channel.SendMessageAsync("Ich muss kurz nachdenken... (Verbindung zu Ollama fehlgeschlagen)");
-                }
-            }
-
-            var threshold = _configuration.GetValue<int>("BotSettings:SummarizationThreshold", 10);
-            if (state.MessagesSinceLastSummary >= threshold)
-            {
-                await RunSummarizationAsync(channelId);
-            }
-        }
-
-        private async Task RunSummarizationAsync(ulong channelId)
-        {
-            _logger.LogInformation($"Running summarization for channel {channelId}");
-            using var scope = _serviceProvider.CreateScope();
-            var ollamaService = scope.ServiceProvider.GetRequiredService<OllamaService>();
-            
-            var state = _campaignManager.GetCampaignState(channelId);
-            if (state == null) return;
-            
-            var messagesToSummarize = state.ShortTermMemory.Take(10).ToList();
-            
-            try
-            {
-                await ollamaService.SummarizeChatAsync(channelId, messagesToSummarize);
-                _campaignManager.ClearOldMessages(channelId, 10);
-                _logger.LogInformation($"Summarization completed for channel {channelId}");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to run summarization loop.");
-            }
-        }
-
-        private async Task SendMessageInChunksAsync(ISocketMessageChannel channel, string text)
-        {
-            const int maxChunkSize = 1900;
-            for (int i = 0; i < text.Length; i += maxChunkSize)
-            {
-                int length = Math.Min(maxChunkSize, text.Length - i);
-                await channel.SendMessageAsync(text.Substring(i, length));
-            }
+            _logger.LogInformation($"[CHAT] {message.Author.Username} in {message.Channel.Name}: {message.Content}");
+            await Task.CompletedTask;
         }
 
         private Task LogAsync(LogMessage log)
         {
             _logger.LogInformation(log.ToString());
+            Console.WriteLine(log.ToString());
+
             return Task.CompletedTask;
         }
     }
