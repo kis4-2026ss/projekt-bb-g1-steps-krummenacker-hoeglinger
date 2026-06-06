@@ -11,7 +11,7 @@ Entwicklung eines Discord-Bots in C# (.NET 8+), der als Dungeon Master (DM) für
 ## 3. Tech-Stack
 - **Programmiersprache:** C# (.NET 8+)
 - **Discord-Anbindung:** Discord.Net
-- **KI-Backend:** Ollama (lokal gehostet auf AMD 7900XT), Kommunikation via OllamaSharp. Modellauswahl: z.B. llama3.
+- **KI-Backend:** Ollama (lokal gehostet auf AMD 9070XT), Kommunikation via OllamaSharp. Modellauswahl: z.B. llama3.
 - **Datenbank:** SQLite via Entity Framework Core (EF Core)
 
 ## 4. Kern-Architektur & Komponenten

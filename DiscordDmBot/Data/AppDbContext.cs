@@ -14,6 +14,7 @@ namespace DiscordDmBot.Data
         }
 
         public DbSet<CampaignEvent> CampaignEvents { get; set; }
+        public DbSet<DbCampaign> Campaigns { get; set; }
 
         protected override void OnConfiguring(DbContextOptionsBuilder optionsBuilder)
         {
@@ -28,9 +29,13 @@ namespace DiscordDmBot.Data
         {
             base.OnModelCreating(modelBuilder);
             
-            // ChannelId is queried often to get past events
+            // CampaignId is queried often to get past events
             modelBuilder.Entity<CampaignEvent>()
-                .HasIndex(e => e.ChannelId);
+                .HasIndex(e => e.CampaignId);
+            
+            modelBuilder.Entity<DbCampaign>()
+                .HasIndex(c => c.Name)
+                .IsUnique();
         }
     }
 }

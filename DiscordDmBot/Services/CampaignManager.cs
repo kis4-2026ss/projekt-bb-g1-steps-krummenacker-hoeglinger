@@ -1,27 +1,123 @@
+using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
+using System.Threading.Tasks;
+using DiscordDmBot.Data;
 using DiscordDmBot.Models;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace DiscordDmBot.Services
 {
     public class CampaignManager
     {
         private readonly ConcurrentDictionary<ulong, CampaignState> _activeCampaigns = new();
+        private readonly IServiceScopeFactory _scopeFactory;
+
+        public CampaignManager(IServiceScopeFactory scopeFactory)
+        {
+            _scopeFactory = scopeFactory;
+        }
 
         public bool IsCampaignActive(ulong channelId) => _activeCampaigns.ContainsKey(channelId);
 
-        public void StartCampaign(ulong channelId, string initialContext = "")
+        public async Task<bool> StartCampaignAsync(ulong channelId, string name, string initialContext = "")
         {
-            _activeCampaigns.TryAdd(channelId, new CampaignState
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            if (await dbContext.Campaigns.AnyAsync(c => c.Name == name))
+            {
+                return false; // Campaign exists
+            }
+
+            var campaign = new DbCampaign
+            {
+                Id = Guid.NewGuid(),
+                Name = name,
+                Context = initialContext,
+                ActiveChannelId = channelId
+            };
+
+            dbContext.Campaigns.Add(campaign);
+            await dbContext.SaveChangesAsync();
+
+            _activeCampaigns[channelId] = new CampaignState
             {
                 ChannelId = channelId,
-                Context = initialContext
-            });
+                CampaignId = campaign.Id,
+                Name = campaign.Name,
+                Context = campaign.Context
+            };
+            return true;
         }
 
-        public void StopCampaign(ulong channelId)
+        public async Task<bool> ContinueCampaignAsync(ulong channelId, string name)
         {
-            _activeCampaigns.TryRemove(channelId, out _);
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            var campaign = await dbContext.Campaigns.FirstOrDefaultAsync(c => c.Name == name);
+            if (campaign == null) return false;
+
+            campaign.ActiveChannelId = channelId;
+            await dbContext.SaveChangesAsync();
+
+            var state = new CampaignState
+            {
+                ChannelId = channelId,
+                CampaignId = campaign.Id,
+                Name = campaign.Name,
+                Context = campaign.Context,
+                MessagesSinceLastSummary = campaign.MessagesSinceLastSummary
+            };
+
+            if (!string.IsNullOrWhiteSpace(campaign.ShortTermMemoryJson))
+            {
+                try {
+                    state.ShortTermMemory = JsonSerializer.Deserialize<List<ChatMessage>>(campaign.ShortTermMemoryJson) ?? new List<ChatMessage>();
+                } catch {
+                    state.ShortTermMemory = new List<ChatMessage>();
+                }
+            }
+
+            _activeCampaigns[channelId] = state;
+            return true;
+        }
+
+        public async Task StopCampaignAsync(ulong channelId)
+        {
+            if (_activeCampaigns.TryRemove(channelId, out var state))
+            {
+                await SaveCampaignStateAsync(state);
+            }
+        }
+
+        public async Task SaveCampaignStateAsync(CampaignState state)
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+            var campaign = await dbContext.Campaigns.FindAsync(state.CampaignId);
+            if (campaign != null)
+            {
+                lock (state)
+                {
+                    campaign.ShortTermMemoryJson = JsonSerializer.Serialize(state.ShortTermMemory);
+                    campaign.MessagesSinceLastSummary = state.MessagesSinceLastSummary;
+                }
+                campaign.ActiveChannelId = null;
+                await dbContext.SaveChangesAsync();
+            }
+        }
+
+        public async Task<List<string>> ListCampaignsAsync()
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            return await dbContext.Campaigns.Select(c => c.Name).ToListAsync();
         }
 
         public CampaignState? GetCampaignState(ulong channelId)

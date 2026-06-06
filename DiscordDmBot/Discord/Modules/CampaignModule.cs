@@ -51,11 +51,11 @@ namespace DiscordDmBot.Discord.Modules
             _campaignManager.AddMessage(channelId.Value, "user", $"{Context.User.Username}: {action}");
 
             using var scope = _serviceProvider.CreateScope();
-            var ollamaService = scope.ServiceProvider.GetRequiredService<OllamaService>();
+            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
 
             try
             {
-                var response = await ollamaService.GenerateResponseAsync(channelId.Value, state.Context, state.ShortTermMemory);
+                var response = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
                 
                 if (!string.IsNullOrWhiteSpace(response))
                 {
@@ -78,16 +78,16 @@ namespace DiscordDmBot.Discord.Modules
                 var threshold = _configuration.GetValue<int>("BotSettings:SummarizationThreshold", 10);
                 if (state.MessagesSinceLastSummary >= threshold)
                 {
-                    await RunAutoSummarizationAsync(channelId.Value, ollamaService);
+                    await RunAutoSummarizationAsync(channelId.Value, geminiService);
                 }
             }
             catch (System.Exception ex)
             {
-                await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Ollama:** {ex.Message}");
+                await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
             }
         }
 
-        private async Task RunAutoSummarizationAsync(ulong channelId, OllamaService ollamaService)
+        private async Task RunAutoSummarizationAsync(ulong channelId, GeminiService geminiService)
         {
             var state = _campaignManager.GetCampaignState(channelId);
             if (state == null) return;
@@ -95,7 +95,7 @@ namespace DiscordDmBot.Discord.Modules
             try
             {
                 var messagesToSummarize = state.ShortTermMemory.Take(10).ToList();
-                await ollamaService.SummarizeChatAsync(channelId, messagesToSummarize);
+                var summary = await geminiService.SummarizeChatAsync(state.CampaignId, messagesToSummarize);
                 _campaignManager.ClearOldMessages(channelId, 10);
             }
             catch
@@ -104,8 +104,8 @@ namespace DiscordDmBot.Discord.Modules
             }
         }
 
-        [SlashCommand("start_campaign", "Startet eine neue Kampagne in diesem Kanal.")]
-        public async Task StartCampaignAsync([Summary("intro", "Kurzer Kontext oder Vorgeschichte")] string intro = "")
+        [SlashCommand("start_campaign", "Startet eine neue benannte Kampagne in diesem Kanal.")]
+        public async Task StartCampaignAsync([Summary("name", "Name der Kampagne")] string name, [Summary("intro", "Kurzer Kontext")] string intro = "")
         {
             await DeferAsync();
 
@@ -118,15 +118,120 @@ namespace DiscordDmBot.Discord.Modules
 
             if (_campaignManager.IsCampaignActive(channelId.Value))
             {
-                await FollowupAsync("Es läuft bereits eine Kampagne in diesem Kanal.");
+                await FollowupAsync("Es läuft bereits eine Kampagne in diesem Kanal. Nutze zuerst `/stop_campaign`.");
                 return;
             }
 
-            _campaignManager.StartCampaign(channelId.Value, intro);
-            await FollowupAsync($"Kampagne gestartet! {(!string.IsNullOrWhiteSpace(intro) ? $"Kontext: {intro}" : "")}");
+            var success = await _campaignManager.StartCampaignAsync(channelId.Value, name, intro);
+            if (!success)
+            {
+                await FollowupAsync($"Eine Kampagne mit dem Namen '{name}' existiert bereits. Nutze `/continue_campaign`.");
+                return;
+            }
+            
+            await FollowupAsync($"Kampagne '{name}' gestartet! {(!string.IsNullOrWhiteSpace(intro) ? $"Kontext: {intro}" : "")}\n*Der Dungeon Master bereitet die Welt vor...*");
+
+            using var scope = _serviceProvider.CreateScope();
+            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+            var state = _campaignManager.GetCampaignState(channelId.Value);
+            
+            if (state != null)
+            {
+                var prompt = "Wir starten jetzt eine neue Kampagne. Schreibe deine Antwort direkt aus der Perspektive des Dungeon Masters. Beschreibe erzählerisch die Umgebung und Situation, in der sich die Spielercharaktere befinden, und frage sie direkt in-character, was sie als nächstes tun möchten. WICHTIG: Verwende keine Formatierungen wie 'Szene:' oder Meta-Notizen.";
+                _campaignManager.AddMessage(channelId.Value, "user", prompt);
+                
+                try
+                {
+                    var aiResponse = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
+                    if (!string.IsNullOrWhiteSpace(aiResponse))
+                    {
+                        const int maxChunkSize = 1900;
+                        for (int i = 0; i < aiResponse.Length; i += maxChunkSize)
+                        {
+                            int length = System.Math.Min(maxChunkSize, aiResponse.Length - i);
+                            await FollowupAsync(aiResponse.Substring(i, length));
+                        }
+                        _campaignManager.AddMessage(channelId.Value, "assistant", aiResponse);
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
+                }
+            }
         }
 
-        [SlashCommand("stop_campaign", "Beendet die aktive Kampagne in diesem Kanal.")]
+        [SlashCommand("continue_campaign", "Lädt eine gespeicherte Kampagne in diesen Kanal.")]
+        public async Task ContinueCampaignAsync([Summary("name", "Name der Kampagne")] string name)
+        {
+            await DeferAsync();
+
+            var channelId = Context.Interaction.ChannelId;
+            if (channelId == null)
+            {
+                await FollowupAsync("Fehler: Kanal konnte nicht identifiziert werden.");
+                return;
+            }
+
+            if (_campaignManager.IsCampaignActive(channelId.Value))
+            {
+                await FollowupAsync("Es läuft bereits eine Kampagne in diesem Kanal. Nutze zuerst `/stop_campaign`.");
+                return;
+            }
+
+            var success = await _campaignManager.ContinueCampaignAsync(channelId.Value, name);
+            if (!success)
+            {
+                await FollowupAsync($"Eine Kampagne mit dem Namen '{name}' wurde nicht gefunden.");
+                return;
+            }
+            
+            await FollowupAsync($"Kampagne '{name}' erfolgreich geladen und fortgesetzt!\n*Der Dungeon Master ruft die Erinnerungen ab...*");
+
+            using var scope = _serviceProvider.CreateScope();
+            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+            var state = _campaignManager.GetCampaignState(channelId.Value);
+            
+            if (state != null)
+            {
+                var prompt = "Wir setzen die Kampagne fort. Schreibe deine Antwort direkt aus der Perspektive des Dungeon Masters. Gib eine kurze, atmosphärische erzählerische Zusammenfassung dessen, was zuletzt passiert ist und wo wir uns befinden. Lass dann NPCs agieren oder beschreibe die Szene weiter und frage die Spieler, was sie als nächstes tun. WICHTIG: Verwende keine Formatierungen wie 'Szene:' oder Meta-Notizen.";
+                _campaignManager.AddMessage(channelId.Value, "user", prompt);
+                
+                try
+                {
+                    var aiResponse = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
+                    if (!string.IsNullOrWhiteSpace(aiResponse))
+                    {
+                        const int maxChunkSize = 1900;
+                        for (int i = 0; i < aiResponse.Length; i += maxChunkSize)
+                        {
+                            int length = System.Math.Min(maxChunkSize, aiResponse.Length - i);
+                            await FollowupAsync(aiResponse.Substring(i, length));
+                        }
+                        _campaignManager.AddMessage(channelId.Value, "assistant", aiResponse);
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
+                }
+            }
+        }
+
+        [SlashCommand("list_campaigns", "Zeigt alle gespeicherten Kampagnen an.")]
+        public async Task ListCampaignsAsync()
+        {
+            await DeferAsync();
+            var campaigns = await _campaignManager.ListCampaignsAsync();
+            if (campaigns.Count == 0)
+            {
+                await FollowupAsync("Es gibt noch keine gespeicherten Kampagnen.");
+                return;
+            }
+            await FollowupAsync($"**Gespeicherte Kampagnen:**\n" + string.Join("\n", campaigns.Select(c => $"- {c}")));
+        }
+
+        [SlashCommand("stop_campaign", "Beendet die aktive Kampagne und speichert sie in der Datenbank.")]
         public async Task StopCampaignAsync()
         {
             await DeferAsync();
@@ -144,8 +249,8 @@ namespace DiscordDmBot.Discord.Modules
                 return;
             }
 
-            _campaignManager.StopCampaign(channelId.Value);
-            await FollowupAsync("Kampagne beendet. Das Langzeitgedächtnis bleibt gespeichert.");
+            await _campaignManager.StopCampaignAsync(channelId.Value);
+            await FollowupAsync("Kampagne pausiert und Fortschritt gespeichert!");
         }
 
         [SlashCommand("summarize", "Erzwingt eine sofortige Zusammenfassung der aktuellen Ereignisse.")]
@@ -167,7 +272,7 @@ namespace DiscordDmBot.Discord.Modules
             await DeferAsync();
 
             using var scope = _serviceProvider.CreateScope();
-            var ollamaService = scope.ServiceProvider.GetRequiredService<OllamaService>();
+            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
             
             var state = _campaignManager.GetCampaignState(channelId.Value);
             if (state == null)
@@ -185,10 +290,17 @@ namespace DiscordDmBot.Discord.Modules
                     return;
                 }
 
-                await ollamaService.SummarizeChatAsync(channelId.Value, messagesToSummarize);
+                var summary = await geminiService.SummarizeChatAsync(state.CampaignId, messagesToSummarize);
                 _campaignManager.ClearOldMessages(channelId.Value, 0);
                 
-                await FollowupAsync("Die Ereignisse wurden erfolgreich zusammengefasst und im Langzeitgedächtnis gespeichert.");
+                if (!string.IsNullOrWhiteSpace(summary))
+                {
+                    await FollowupAsync($"**Zusammenfassung gespeichert:**\n> {summary.Replace("\n", "\n> ")}");
+                }
+                else
+                {
+                    await FollowupAsync("⚠️ Die Ereignisse konnten nicht zusammengefasst werden (leere Antwort).");
+                }
             }
             catch (System.Exception ex)
             {
@@ -222,6 +334,90 @@ namespace DiscordDmBot.Discord.Modules
             }
 
             await RespondAsync(sb.ToString(), ephemeral: true);
+        }
+        [SlashCommand("roll", "Würfelt Würfel, z.B. 1d20+5 oder d6")]
+        public async Task RollAsync([Summary("wurf", "Der Würfelwurf (z.B. 1d20+3)")] string diceExpression)
+        {
+            await DeferAsync();
+
+            var channelId = Context.Interaction.ChannelId;
+            if (channelId == null)
+            {
+                await FollowupAsync("Fehler: Kanal konnte nicht identifiziert werden.");
+                return;
+            }
+
+            if (!_campaignManager.IsCampaignActive(channelId.Value))
+            {
+                await FollowupAsync("Hier läuft aktuell keine Kampagne. Nutze `/start_campaign`, um eine zu beginnen.");
+                return;
+            }
+
+            // Parse expression
+            var match = System.Text.RegularExpressions.Regex.Match(diceExpression.ToLower().Replace(" ", ""), @"^(\d*)d(\d+)([\+\-]\d+)?$");
+            if (!match.Success)
+            {
+                await FollowupAsync("Ungültiges Würfelformat! Bitte benutze ein Format wie `1d20+3`, `2d6`, oder `d20`.");
+                return;
+            }
+
+            int count = string.IsNullOrEmpty(match.Groups[1].Value) ? 1 : int.Parse(match.Groups[1].Value);
+            int sides = int.Parse(match.Groups[2].Value);
+            int modifier = string.IsNullOrEmpty(match.Groups[3].Value) ? 0 : int.Parse(match.Groups[3].Value);
+
+            if (count <= 0 || count > 100 || sides <= 1 || sides > 1000)
+            {
+                await FollowupAsync("Bitte verwende realistische Würfelwerte (max 100 Würfel, max 1000 Seiten).");
+                return;
+            }
+
+            var rand = new System.Random();
+            var rolls = new System.Collections.Generic.List<int>();
+            int sum = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int r = rand.Next(1, sides + 1);
+                rolls.Add(r);
+                sum += r;
+            }
+            
+            int total = sum + modifier;
+
+            var modifierString = modifier == 0 ? "" : (modifier > 0 ? $" + {modifier}" : $" - {System.Math.Abs(modifier)}");
+            var rollDetails = count == 1 ? $"[{rolls[0]}]" : $"[{string.Join(", ", rolls)}]";
+            var responseText = $"🎲 **{Context.User.Username}** würfelt `{diceExpression}`:\n{rollDetails}{modifierString} = **{total}**";
+
+            await FollowupAsync(responseText);
+
+            // Add to AI context
+            var aiMessage = $"[WÜRFEL-ERGEBNIS] {Context.User.Username} würfelt {diceExpression} und erzielt eine {total}.";
+            _campaignManager.AddMessage(channelId.Value, "user", aiMessage);
+
+            var state = _campaignManager.GetCampaignState(channelId.Value);
+            if (state != null)
+            {
+                using var scope = _serviceProvider.CreateScope();
+                var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+                
+                try
+                {
+                    var aiResponse = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
+                    if (!string.IsNullOrWhiteSpace(aiResponse))
+                    {
+                        const int maxChunkSize = 1900;
+                        for (int i = 0; i < aiResponse.Length; i += maxChunkSize)
+                        {
+                            int length = System.Math.Min(maxChunkSize, aiResponse.Length - i);
+                            await FollowupAsync(aiResponse.Substring(i, length));
+                        }
+                        _campaignManager.AddMessage(channelId.Value, "assistant", aiResponse);
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
+                }
+            }
         }
     }
 }

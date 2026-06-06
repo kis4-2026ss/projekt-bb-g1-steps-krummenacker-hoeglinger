@@ -41,10 +41,17 @@ builder.Services.AddSingleton<InteractionService>(sp => {
 
 // Services
 builder.Services.AddSingleton<CampaignManager>();
-builder.Services.AddScoped<OllamaService>();
+builder.Services.AddHttpClient<GeminiService>();
 
 // Worker
 builder.Services.AddHostedService<DiscordBotWorker>();
 
 var host = builder.Build();
+
+using (var scope = host.Services.CreateScope())
+{
+    var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    dbContext.Database.EnsureCreated();
+}
+
 host.Run();
