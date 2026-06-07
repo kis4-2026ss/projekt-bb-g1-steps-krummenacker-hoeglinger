@@ -183,6 +183,62 @@ namespace DiscordDmBot.Services
             }
         }
 
+        public async Task<string> GenerateSpellAsync(int level, string theme)
+        {
+            var prompt = $@"Erfinde einen komplett neuen D&D 5e Zauber zum Thema '{theme}'. 
+Der Zauber soll den Grad (Level) {level} haben. 
+Gib AUSSCHLIESSLICH den Zauber im folgenden Markdown-Format zurück. Vermeide jeglichen zusätzlichen Text oder Erklärungen. 
+
+### [Englischer Name] ([Deutscher Name])
+*[Level in englisch, z.B. 1st-level] [Magieschule in englisch]*
+* **Zeitaufwand (Casting Time):** [Aktion/Bonusaktion/Reaktion/Minuten]
+* **Reichweite (Range):** [Reichweite in Fuß oder Berührung/Selbst]
+* **Komponenten (Components):** [V, S, M (Materialien)]
+* **Dauer (Duration):** [Sofort/Konzentration/Minuten/Stunden]
+* **Beschreibung:** [Eine detaillierte und balancierte Beschreibung der Effekte, passend zum Level {level}.]
+* **Höhere Stufen:** [Optional: Effekt bei Nutzung eines höheren Zauberslots, falls zutreffend]";
+
+            var (isSuccess, responseJson, errorMsg) = await ExecuteWithRetryAsync((modelName) => {
+                return new
+                {
+                    contents = new[]
+                    {
+                        new
+                        {
+                            role = "user",
+                            parts = new[] { new { text = prompt } }
+                        }
+                    }
+                };
+            });
+
+            if (!isSuccess) return string.Empty;
+
+            using var doc = JsonDocument.Parse(responseJson);
+            
+            try {
+                var spellText = doc.RootElement
+                    .GetProperty("candidates")[0]
+                    .GetProperty("content")
+                    .GetProperty("parts")[0]
+                    .GetProperty("text")
+                    .GetString();
+
+                if (spellText != null)
+                {
+                    if (spellText.StartsWith("```markdown")) spellText = spellText.Substring(11);
+                    else if (spellText.StartsWith("```")) spellText = spellText.Substring(3);
+                    if (spellText.EndsWith("```")) spellText = spellText.Substring(0, spellText.Length - 3);
+                    return spellText.Trim();
+                }
+            }
+            catch {
+                // Silently fail if parsing fails
+            }
+            
+            return string.Empty;
+        }
+
         public async Task<string> SummarizeChatAsync(Guid campaignId, List<ChatMessage> messagesToSummarize)
         {
             if (!messagesToSummarize.Any()) return string.Empty;

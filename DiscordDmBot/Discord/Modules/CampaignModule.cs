@@ -47,14 +47,20 @@ namespace DiscordDmBot.Discord.Modules
                 return;
             }
 
-            // Record user message
-            _campaignManager.AddMessage(channelId.Value, "user", $"{Context.User.Username}: {action}");
-
-            using var scope = _serviceProvider.CreateScope();
-            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+            if (!await _campaignManager.TryLockCampaignAsync(channelId.Value))
+            {
+                await FollowupAsync("⏳ Der Dungeon Master verarbeitet gerade eine andere Aktion. Bitte warte einen Moment...");
+                return;
+            }
 
             try
             {
+                // Record user message
+                _campaignManager.AddMessage(channelId.Value, "user", $"{Context.User.Username}: {action}");
+
+                using var scope = _serviceProvider.CreateScope();
+                var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+
                 var response = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
                 
                 if (!string.IsNullOrWhiteSpace(response))
@@ -84,6 +90,10 @@ namespace DiscordDmBot.Discord.Modules
             catch (System.Exception ex)
             {
                 await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
+            }
+            finally
+            {
+                _campaignManager.UnlockCampaign(channelId.Value);
             }
         }
 
@@ -137,7 +147,7 @@ namespace DiscordDmBot.Discord.Modules
             
             if (state != null)
             {
-                var prompt = "Wir starten jetzt eine neue Kampagne. Schreibe deine Antwort direkt aus der Perspektive des Dungeon Masters. Beschreibe erzählerisch die Umgebung und Situation, in der sich die Spielercharaktere befinden, und frage sie direkt in-character, was sie als nächstes tun möchten. WICHTIG: Verwende keine Formatierungen wie 'Szene:' oder Meta-Notizen.";
+                var prompt = "Wir starten jetzt eine neue Kampagne. Generiere exakt 3 unterschiedliche, kurze Start-Szenarien für die Spieler. Jedes Szenario MUSS mit dem Text 'OPTION 1:', 'OPTION 2:' oder 'OPTION 3:' beginnen. Behalte die Szenarien knapp (jeweils max 2-3 Sätze).";
                 _campaignManager.AddMessage(channelId.Value, "user", prompt);
                 
                 try
@@ -145,13 +155,41 @@ namespace DiscordDmBot.Discord.Modules
                     var aiResponse = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
                     if (!string.IsNullOrWhiteSpace(aiResponse))
                     {
-                        const int maxChunkSize = 1900;
-                        for (int i = 0; i < aiResponse.Length; i += maxChunkSize)
+                        var options = new System.Collections.Generic.List<string>();
+                        var matches = System.Text.RegularExpressions.Regex.Matches(aiResponse, @"OPTION \d+:(.*?)(?=OPTION \d+:|$)", System.Text.RegularExpressions.RegexOptions.Singleline);
+                        foreach (System.Text.RegularExpressions.Match m in matches)
                         {
-                            int length = System.Math.Min(maxChunkSize, aiResponse.Length - i);
-                            await FollowupAsync(aiResponse.Substring(i, length));
+                            options.Add(m.Groups[1].Value.Trim());
                         }
-                        _campaignManager.AddMessage(channelId.Value, "assistant", aiResponse);
+
+                        if (options.Count >= 3)
+                        {
+                            var menuBuilder = new SelectMenuBuilder()
+                                .WithPlaceholder("Wähle ein Start-Szenario")
+                                .WithCustomId("select_campaign_start")
+                                .WithMinValues(1)
+                                .WithMaxValues(1);
+
+                            for (int i = 0; i < 3; i++)
+                            {
+                                var desc = options[i].Length > 90 ? options[i].Substring(0, 87) + "..." : options[i];
+                                menuBuilder.AddOption($"Option {i + 1}", $"opt_{i + 1}", desc);
+                            }
+
+                            var component = new ComponentBuilder().WithSelectMenu(menuBuilder).Build();
+                            var msg = $"*Der Dungeon Master bietet dir 3 mögliche Einstiege an:*\n\n**Option 1:** {options[0]}\n\n**Option 2:** {options[1]}\n\n**Option 3:** {options[2]}";
+                            await FollowupAsync(msg, components: component);
+                        }
+                        else
+                        {
+                            const int maxChunkSize = 1900;
+                            for (int i = 0; i < aiResponse.Length; i += maxChunkSize)
+                            {
+                                int length = System.Math.Min(maxChunkSize, aiResponse.Length - i);
+                                await FollowupAsync(aiResponse.Substring(i, length));
+                            }
+                            _campaignManager.AddMessage(channelId.Value, "assistant", aiResponse);
+                        }
                     }
                 }
                 catch (System.Exception ex)
@@ -335,6 +373,40 @@ namespace DiscordDmBot.Discord.Modules
 
             await RespondAsync(sb.ToString(), ephemeral: true);
         }
+        [SlashCommand("invent_spell", "Erfindet einen neuen Zauber und speichert ihn in den Regeln.")]
+        public async Task InventSpellAsync([Summary("thema", "Das Thema oder die Art des Zaubers (z.B. 'ein Feuerangriff')")] string thema, [Summary("grad", "Der Grad (Level) des Zaubers (0-9)")] int grad)
+        {
+            await DeferAsync();
+
+            if (grad < 0 || grad > 9)
+            {
+                await FollowupAsync("Der Zaubergrad muss zwischen 0 und 9 liegen.");
+                return;
+            }
+
+            using var scope = _serviceProvider.CreateScope();
+            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+
+            await FollowupAsync($"*Der Dungeon Master konsultiert die alten Schriften, um einen neuen Zauber des {grad}. Grades über '{thema}' zu erforschen...*");
+
+            string spellMarkdown = await geminiService.GenerateSpellAsync(grad, thema);
+
+            if (string.IsNullOrWhiteSpace(spellMarkdown))
+            {
+                await FollowupAsync("⚠️ Fehler beim Generieren des Zaubers.");
+                return;
+            }
+
+            var spellId = System.Guid.NewGuid().ToString("N");
+            _campaignManager.AddPendingSpell(spellId, Context.User.Id, grad, thema, spellMarkdown);
+
+            var builder = new ComponentBuilder()
+                .WithButton("✨ Speichern", $"spell_approve_{spellId}", ButtonStyle.Success)
+                .WithButton("🗑️ Verwerfen", $"spell_reject_{spellId}", ButtonStyle.Danger);
+
+            await FollowupAsync($"**Der Dungeon Master hat folgenden Zauber entwickelt:**\n\n{spellMarkdown}\n\nMöchtest du ihn in die Datenbank aufnehmen?", components: builder.Build());
+        }
+
         [SlashCommand("roll", "Würfelt Würfel, z.B. 1d20+5 oder d6")]
         public async Task RollAsync([Summary("wurf", "Der Würfelwurf (z.B. 1d20+3)")] string diceExpression)
         {
@@ -417,6 +489,182 @@ namespace DiscordDmBot.Discord.Modules
                 {
                     await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
                 }
+            }
+        }
+
+        [ComponentInteraction("spell_approve_*")]
+        public async Task SpellApproveAsync(string spellId)
+        {
+            var spell = _campaignManager.GetAndRemovePendingSpell(spellId);
+            if (spell == null)
+            {
+                await RespondAsync("Dieser Zauber wurde bereits bearbeitet oder ist abgelaufen.", ephemeral: true);
+                return;
+            }
+
+            if (spell.UserId != Context.User.Id)
+            {
+                await RespondAsync("Nur der Ersteller des Zaubers kann ihn bestätigen.", ephemeral: true);
+                _campaignManager.AddPendingSpell(spellId, spell.UserId, spell.Grad, spell.Thema, spell.SpellMarkdown);
+                return;
+            }
+
+            await DeferAsync();
+
+            try
+            {
+                var rulesDir = System.IO.Path.Combine(System.AppContext.BaseDirectory, "Rules");
+                if (!System.IO.Directory.Exists(rulesDir)) System.IO.Directory.CreateDirectory(rulesDir);
+                
+                var filePath = System.IO.Path.Combine(rulesDir, "DnD_Zauber_Datenbank.md");
+                
+                var sourcePath = System.IO.Path.GetFullPath(System.IO.Path.Combine(System.AppContext.BaseDirectory, "..", "..", "..", "Rules", "DnD_Zauber_Datenbank.md"));
+                if (System.IO.File.Exists(sourcePath)) {
+                    filePath = sourcePath;
+                }
+
+                if (!System.IO.File.Exists(filePath))
+                {
+                    await System.IO.File.WriteAllTextAsync(filePath, "# D&D 5e Zauber-Datenbank (Spells)\n\n");
+                }
+
+                var content = await System.IO.File.ReadAllTextAsync(filePath);
+                var lines = content.Split('\n').ToList();
+
+                string searchHeader = spell.Grad == 0 ? "## 1. Zaubertricks (Cantrips / Grad 0)" : $"## {spell.Grad + 1}. Zauber des {spell.Grad}. Grades";
+                
+                int insertIndex = -1;
+                bool sectionFound = false;
+
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    if (lines[i].StartsWith(searchHeader) || (spell.Grad > 0 && lines[i].StartsWith($"## ") && lines[i].Contains($"{spell.Grad}. Grades")))
+                    {
+                        sectionFound = true;
+                        insertIndex = i + 1;
+                        while (insertIndex < lines.Count && !lines[insertIndex].StartsWith("## "))
+                        {
+                            insertIndex++;
+                        }
+                        
+                        while (insertIndex > 0 && (string.IsNullOrWhiteSpace(lines[insertIndex - 1]) || lines[insertIndex - 1].StartsWith("---")))
+                        {
+                            insertIndex--;
+                        }
+                        break;
+                    }
+                }
+
+                if (!sectionFound)
+                {
+                    lines.Add("");
+                    lines.Add("---");
+                    lines.Add("");
+                    string newHeader = spell.Grad == 0 ? "## 1. Zaubertricks (Cantrips / Grad 0)" : $"## {spell.Grad + 1}. Zauber des {spell.Grad}. Grades ({spell.Grad}th Level Spells)";
+                    lines.Add(newHeader);
+                    lines.Add("");
+                    insertIndex = lines.Count;
+                }
+
+                lines.Insert(insertIndex, "");
+                var spellLines = spell.SpellMarkdown.Split('\n');
+                for (int i = spellLines.Length - 1; i >= 0; i--)
+                {
+                    lines.Insert(insertIndex, spellLines[i].TrimEnd('\r'));
+                }
+                lines.Insert(insertIndex, "");
+
+                await System.IO.File.WriteAllTextAsync(filePath, string.Join("\n", lines));
+
+                await ModifyOriginalResponseAsync(x => {
+                    x.Components = new ComponentBuilder().Build();
+                });
+                
+                await FollowupAsync($"✅ **Der Zauber '{spell.Thema}' wurde in die Datenbank aufgenommen!**");
+
+                var channelId = Context.Interaction.ChannelId;
+                if (channelId != null && _campaignManager.IsCampaignActive(channelId.Value))
+                {
+                    _campaignManager.AddMessage(channelId.Value, "system", $"[SYSTEM] Ein neuer Zauber wurde der Welt hinzugefügt:\n{spell.SpellMarkdown}");
+                }
+            }
+            catch (System.Exception ex)
+            {
+                await FollowupAsync($"⚠️ Fehler beim Speichern des Zaubers in der Datenbank: {ex.Message}");
+            }
+        }
+
+        [ComponentInteraction("spell_reject_*")]
+        public async Task SpellRejectAsync(string spellId)
+        {
+            var spell = _campaignManager.GetAndRemovePendingSpell(spellId);
+            if (spell == null)
+            {
+                await RespondAsync("Dieser Zauber wurde bereits bearbeitet oder ist abgelaufen.", ephemeral: true);
+                return;
+            }
+
+            if (spell.UserId != Context.User.Id)
+            {
+                await RespondAsync("Nur der Ersteller des Zaubers kann ihn verwerfen.", ephemeral: true);
+                _campaignManager.AddPendingSpell(spellId, spell.UserId, spell.Grad, spell.Thema, spell.SpellMarkdown);
+                return;
+            }
+
+            await RespondAsync("Der Zauber wurde verworfen.", ephemeral: true);
+            await ModifyOriginalResponseAsync(x => {
+                x.Components = new ComponentBuilder().Build();
+            });
+        }
+
+        [ComponentInteraction("select_campaign_start")]
+        public async Task SelectCampaignStartAsync(string[] selectedValues)
+        {
+            await DeferAsync();
+
+            var channelId = Context.Interaction.ChannelId;
+            if (channelId == null) return;
+
+            var state = _campaignManager.GetCampaignState(channelId.Value);
+            if (state == null) return;
+
+            var selection = selectedValues.FirstOrDefault();
+            string optName = selection switch {
+                "opt_1" => "Option 1",
+                "opt_2" => "Option 2",
+                "opt_3" => "Option 3",
+                _ => "eine Option"
+            };
+
+            await ModifyOriginalResponseAsync(x => {
+                x.Components = new ComponentBuilder().Build();
+            });
+
+            await FollowupAsync($"Der Spieler hat **{optName}** gewählt. Die Geschichte beginnt...\n*Der Dungeon Master bereitet sich vor...*");
+
+            using var scope = _serviceProvider.CreateScope();
+            var geminiService = scope.ServiceProvider.GetRequiredService<GeminiService>();
+
+            var prompt = $"Der Spieler hat {optName} aus den vorherigen Vorschlägen gewählt. Bitte schreibe nun die vollständige erste Szene für diesen Einstieg aus der Perspektive des Dungeon Masters. Beschreibe atmosphärisch die Situation und frage am Ende direkt die Spieler, was sie tun möchten.";
+            _campaignManager.AddMessage(channelId.Value, "user", prompt);
+            
+            try
+            {
+                var aiResponse = await geminiService.GenerateResponseAsync(state.CampaignId, state.Context, state.ShortTermMemory);
+                if (!string.IsNullOrWhiteSpace(aiResponse))
+                {
+                    const int maxChunkSize = 1900;
+                    for (int i = 0; i < aiResponse.Length; i += maxChunkSize)
+                    {
+                        int length = System.Math.Min(maxChunkSize, aiResponse.Length - i);
+                        await FollowupAsync(aiResponse.Substring(i, length));
+                    }
+                    _campaignManager.AddMessage(channelId.Value, "assistant", aiResponse);
+                }
+            }
+            catch (System.Exception ex)
+            {
+                await FollowupAsync($"❌ **Fehler bei der Kommunikation mit Gemini:** {ex.Message}");
             }
         }
     }

@@ -14,6 +14,8 @@ namespace DiscordDmBot.Services
     public class CampaignManager
     {
         private readonly ConcurrentDictionary<ulong, CampaignState> _activeCampaigns = new();
+        private readonly ConcurrentDictionary<ulong, SemaphoreSlim> _campaignLocks = new();
+        private readonly ConcurrentDictionary<string, PendingSpell> _pendingSpells = new();
         private readonly IServiceScopeFactory _scopeFactory;
 
         public CampaignManager(IServiceScopeFactory scopeFactory)
@@ -154,5 +156,44 @@ namespace DiscordDmBot.Services
                 }
             }
         }
+
+        public async Task<bool> TryLockCampaignAsync(ulong channelId)
+        {
+            var semaphore = _campaignLocks.GetOrAdd(channelId, _ => new SemaphoreSlim(1, 1));
+            return await semaphore.WaitAsync(0);
+        }
+
+        public void UnlockCampaign(ulong channelId)
+        {
+            if (_campaignLocks.TryGetValue(channelId, out var semaphore))
+            {
+                if (semaphore.CurrentCount == 0)
+                {
+                    semaphore.Release();
+                }
+            }
+        }
+
+        public void AddPendingSpell(string id, ulong userId, int grad, string thema, string spellMarkdown)
+        {
+            _pendingSpells[id] = new PendingSpell { UserId = userId, Grad = grad, Thema = thema, SpellMarkdown = spellMarkdown };
+        }
+
+        public PendingSpell? GetAndRemovePendingSpell(string id)
+        {
+            if (_pendingSpells.TryRemove(id, out var spell))
+            {
+                return spell;
+            }
+            return null;
+        }
+    }
+
+    public class PendingSpell
+    {
+        public ulong UserId { get; set; }
+        public int Grad { get; set; }
+        public string Thema { get; set; } = string.Empty;
+        public string SpellMarkdown { get; set; } = string.Empty;
     }
 }
